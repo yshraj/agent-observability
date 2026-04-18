@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# SQLite database (runtime artifacts)
+backend/agent_events.db
+backend/agent_events.db-shm
+backend/agent_events.db-wal
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Claude Code internal files
+frontend/CLAUDE.md
+frontend/AGENTS.md
