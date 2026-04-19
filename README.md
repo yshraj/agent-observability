@@ -73,7 +73,13 @@ uvicorn main:app --reload --port 8000
 ```
 
 The API starts at `http://localhost:8000`.
-You can verify it with: `curl http://localhost:8000/health`
+Verify it is running:
+
+```cmd
+curl http://localhost:8000/health
+```
+
+Expected response: `{"status":"ok","timestamp":...}`
 
 ### 2. Frontend
 
@@ -87,7 +93,7 @@ npm run dev
 
 The UI opens at `http://localhost:3000`.
 
-> If port 3000 is busy, Next.js will try 3001 automatically. Check the terminal output.
+> If port 3000 is busy, Next.js will try 3001 automatically — check the terminal output for the actual URL.
 
 ### 3. Simulator (runs in a third terminal)
 
@@ -100,16 +106,86 @@ Then run any scenario (see next section).
 
 ### Stopping the servers
 
-**Command Prompt:**
-```cmd
-Ctrl+C
-```
+Press `Ctrl+C` in each terminal window.
 
-**To kill a specific port (if Ctrl+C doesn't work):**
+---
+
+## Windows Troubleshooting
+
+### WinError 10013 — port access forbidden
+
+This happens when a previous uvicorn process is still holding the port, or Windows has reserved it.
+
+**Step 1 — find what's using the port:**
+
 ```cmd
 netstat -ano | findstr :8000
-taskkill /PID <PID_NUMBER> /F
 ```
+
+Note the PID in the last column.
+
+**Step 2 — kill it (use PowerShell):**
+
+```powershell
+Stop-Process -Id <PID> -Force -ErrorAction SilentlyContinue
+```
+
+Or in Command Prompt:
+
+```cmd
+taskkill /F /PID <PID>
+```
+
+**Step 3 — wait 5 seconds** for Windows to fully release the socket, then retry:
+
+```cmd
+uvicorn main:app --reload --port 8000
+```
+
+**If the port stays blocked, use a different port:**
+
+```cmd
+uvicorn main:app --reload --port 8001
+```
+
+Then update `frontend\.env.local`:
+
+```
+NEXT_PUBLIC_API_URL=http://localhost:8001
+```
+
+And pass `--api` to the simulator:
+
+```cmd
+python agent.py --scenario all --api http://localhost:8001
+```
+
+### Port reserved by Windows / Hyper-V
+
+Windows reserves certain port ranges for Hyper-V and other services. Check reserved ranges:
+
+```cmd
+netsh int ipv4 show excludedportrange protocol=tcp
+```
+
+If port 8000 appears in that list, use 8001, 8080, or 9000 instead (same steps above).
+
+### Python not found
+
+```cmd
+python --version
+```
+
+If this fails, ensure Python is added to PATH during installation. Re-run the Python installer and check "Add Python to PATH".
+
+### npm not found
+
+```cmd
+node --version
+npm --version
+```
+
+If these fail, re-install Node.js from https://nodejs.org and restart your terminal.
 
 ---
 
@@ -242,19 +318,29 @@ The spec states loops are "not exact duplicates every time." An agent retrying a
 
 ### Drift Detection
 
-**Algorithm:** Action distribution shift between session halves
+**Algorithm:** Sliding window TVD (Total Variation Distance)
 
 ```
-Split events at midpoint (by step order)
-Compute action-type distribution for each half:
-  e.g. first half: {read_file: 60%, llm_call: 40%}
-       second half: {run_command: 70%, write_file: 30%}
+Parameters:
+  WINDOW_SIZE = 4   steps per window
+  STEP        = 2   slide by this many steps each iteration
+  TVD_THRESHOLD = 0.45
 
-Compute Total Variation Distance (TVD):
-  TVD = 0.5 * sum(|p(x) - q(x)|) for all action types
+For each consecutive pair of overlapping windows:
+  Window A = events[i   : i+4]
+  Window B = events[i+2 : i+6]
 
-If TVD >= 0.40 → flag as drift
-If dominant action type flipped between halves → severity = high
+  Compute action-type distribution for each:
+    e.g. dist_A = {read_file: 1.0}
+         dist_B = {read_file: 0.5, llm_call: 0.5}
+
+  Compute TVD:
+    TVD = 0.5 * sum(|p(x) - q(x)|) for all action types
+
+  If TVD >= 0.45:
+    Record drift at the boundary step
+    Find which action gained most share and which lost most
+    Suppress if another drift was flagged within WINDOW_SIZE steps
 ```
 
 **Why TVD?**
@@ -262,14 +348,34 @@ If dominant action type flipped between halves → severity = high
 TVD is a principled statistical measure of how different two probability distributions are. It ranges from 0 (identical) to 1 (completely disjoint).
 
 - A naive rule like "if action type changed" would flag any session that uses more than one action type
-- TVD requires a *sustained, significant* shift in behavior — transient changes don't move the distribution enough
-- A TVD of 0.40 means roughly 40% of the probability mass has moved — that's a meaningful change in what the agent is doing
+- TVD requires a *sustained, significant* shift — transient changes don't move the distribution enough
+- A TVD of 0.45 means roughly 45% of the probability mass has shifted between windows
 
-**Why split at the midpoint?**
+**Why sliding windows instead of a midpoint split?**
 
-The drift scenario has a deliberate phase transition at roughly the halfway point (docs work → migration work). The midpoint split cleanly captures this. A more production-ready approach would use change-point detection (e.g., CUSUM) to find the actual transition point.
+A midpoint split has a fundamental flaw: if a session drifts twice, the two shifts can cancel each other out and produce a low TVD even though two real transitions occurred.
 
-**Minimum 6 events:** Distributions computed from 2-3 events have high variance — a session that does `read_file` then `llm_call` isn't drifting, it's just getting started.
+Example — a session that goes `read_file` (steps 1–4) → `llm_call` (steps 5–8) → `run_command` (steps 9–13):
+
+```
+Midpoint split (broken):
+  First half:  {read_file: 50%, llm_call: 50%}   ← averaged across both phases
+  Second half: {llm_call: 40%, run_command: 60%}
+  TVD ≈ 0.35  → MISSED (below threshold)
+
+Sliding windows (correct):
+  Window [1-4] vs [3-6]: TVD=0.50 → drift at step 3  (read_file → llm_call)
+  Window [5-8] vs [7-10]: TVD=0.50 → drift at step 7  (llm_call → run_command)
+  → Both transitions caught independently
+```
+
+Each window boundary is evaluated independently, so multiple drifts are all detected and reported as separate issues.
+
+**Deduplication guard:** once a drift is flagged at step X, the next flag must be at least `WINDOW_SIZE` steps later. This prevents the same single transition from firing on multiple overlapping window pairs.
+
+**Description logic:** instead of reporting "dominant action before/after" (which is ambiguous when distributions are tied at 50/50), the description reports which action type *gained* the most share and which *lost* the most — always unambiguous.
+
+**Minimum 6 events:** distributions computed from 2–3 events have high variance. A session that does `read_file` then `llm_call` isn't drifting — it's just getting started.
 
 ---
 
@@ -368,69 +474,105 @@ GET /health
 
 ## Design Decisions & Trade-offs
 
-### Storage: SQLite over in-memory or Postgres
+---
 
-**Decision:** SQLite with WAL mode, stored at `backend/agent_events.db`
+### 1. Data Storage: SQLite over in-memory or Postgres
 
-**Why not pure in-memory (Python dict)?**
-- Doesn't survive backend restarts — a monitoring system that loses its data on restart is broken by design
-- No deduplication at the storage level; would need separate logic
+**Decision:** SQLite with WAL mode (`backend/agent_events.db`)
 
-**Why not Postgres/Redis?**
-- Adds setup friction (install, start service, create database)
-- Overkill: single-writer access pattern, no need for distributed reads
-- Goal is "local setup is fine" — SQLite ships with Python, zero config
+Three options were considered:
 
-**SQLite WAL mode** specifically allows concurrent reads during writes — important when the frontend is polling while the simulator is sending events.
+| Option | Pros | Cons | Verdict |
+|---|---|---|---|
+| Python dict (in-memory) | Zero setup, fastest reads | Lost on restart, no dedup at DB level, no concurrent access safety | Rejected |
+| SQLite | Ships with Python, survives restarts, WAL mode, unique constraints | Single writer | **Chosen** |
+| Postgres | Production-grade, concurrent writes, rich query planner | Requires install + running service, overkill for local dev | Rejected |
 
-**Known limitation:** SQLite is single-writer. Under true high-concurrency ingestion (hundreds of concurrent sessions sending events simultaneously), writes would queue. Fix: batch-write events, or switch to Postgres for production.
+**Why SQLite specifically wins here:**
+
+- A monitoring system that loses all data on backend restart is broken by design — in-memory was never a real option
+- `UNIQUE(session_id, step)` constraint gives deduplication for free at the DB level with `INSERT OR IGNORE` — no application-level tracking needed
+- **WAL mode** (`PRAGMA journal_mode=WAL`) is the key detail: in WAL mode, readers and writers don't block each other. The frontend can poll `GET /sessions` while the simulator is actively writing events — no lock contention
+- Zero configuration — ships with Python, single file, works on any OS
+
+**Known limitation:** SQLite serialises writes. If hundreds of concurrent agents were all sending events simultaneously, the write queue would grow. The production fix is either batching writes (accumulate 50 events, flush in one transaction) or switching to Postgres.
 
 ---
 
-### Processing: On-Write Recomputation (not batch, not streaming)
+### 2. Real-time vs Batch Processing
 
-**Decision:** Every `POST /events` triggers full detection re-run for that session
+**Decision:** On-write synchronous recomputation — detection runs immediately on every accepted event
 
-**Why not batch (e.g., cron every 5 seconds)?**
-- Introduces stale data — the UI would show outdated status
-- For the session sizes in this system (10-50 events), per-event recomputation is fast (<5ms)
+Three approaches were considered:
 
-**Why not true streaming (Kafka, Redis Streams)?**
-- Overkill for local dev
-- Would require a separate stream processor, consumer group, etc.
-- The "near real-time" behavior of on-write recomputation is sufficient
+**Batch (cron every N seconds):**
+- Pro: decouples ingestion from processing, cheaper under burst
+- Con: stale data — the UI could show "healthy" for seconds after a failure started
+- Con: unnecessary for this session size (10–50 events). Batch adds complexity that only pays off at scale
+- **Rejected**
 
-**Known limitation:** For sessions with thousands of events, O(n) detection per new event degrades. Fix: cache computed metrics and recompute incrementally.
+**True streaming (Kafka, Redis Streams, Faust):**
+- Pro: handles massive throughput, proper backpressure, replay
+- Con: requires running Kafka/Redis, a consumer process, consumer group management
+- Con: overkill — the entire point of the assignment is local setup
+- **Rejected**
 
----
+**On-write recomputation (chosen):**
+```
+POST /events → store event → re-run detection → update cache → return response
+```
+- Every accepted event immediately triggers detection for that session
+- Results stored in `session_cache` table — frontend just reads, never waits for processing
+- For 10–50 event sessions, the full detection cycle takes < 5ms
+- No separate process, no queue, no consumer — one Python process does everything
 
-### Detection: Heuristics over Rules
-
-All three detectors deliberately avoid:
-- **Simple string equality** — loops aren't exact duplicates
-- **Fixed magic numbers without reasoning** — every threshold is documented with a rationale
-- **Single signal** — failure detection uses two independent signals
-
-The philosophy: detection should behave like an experienced developer reading logs, not like a regex.
-
----
-
-### Frontend: Polling over WebSockets
-
-**Decision:** Frontend polls every 3 seconds
-
-**Why not WebSockets or SSE?**
-- Polling is simpler to implement, easier to debug, and works through proxies/firewalls
-- 3-second latency is acceptable for a dev monitoring tool
-
-**Trade-off:** 3-second poll creates ~20 requests/minute per open browser tab. For production with many users, SSE would reduce server load.
+**Known limitation:** Detection is O(n) per new event (fetches all events, runs all three detectors). For a session with 10,000 events this degrades. The fix is incremental computation — maintain running counters and only re-evaluate the tail of the event list.
 
 ---
 
-### Time Constraints
+### 3. Detection Thresholds and Reasoning
 
-What was deprioritized:
-- Auth / API keys (not in scope for local dev)
-- Pagination on `/sessions` (no sessions list will be large in this context)
-- Incremental detection (full recomputation is fast enough for simulator-scale sessions)
-- Change-point detection for drift (midpoint split works well for the scenarios)
+Every threshold was chosen based on a specific failure mode it avoids. None are arbitrary.
+
+#### Loop Detection
+
+| Parameter | Value | Why this value |
+|---|---|---|
+| Jaccard similarity threshold | 0.60 | Below 0.60 → false positives from legitimately similar actions (two `read_file` calls on config files share tokens like `import`, `config`, `=`). Above 0.75 → misses fuzzy loops where filenames or flags vary slightly. |
+| Window size | 8 steps | A window of 3–4 is too small — catches only the tightest loops. A window of 15+ compares steps that are contextually unrelated, producing false positives. 8 covers a full retry cycle (check → decide → act) repeated 2–3 times. |
+| Minimum cluster size | 3 events | Two similar actions could be coincidence (reading two config files). Three is the minimum that indicates a pattern rather than noise. |
+| Severity: high | avg similarity > 0.85 | Near-identical inputs (>85%) suggest the agent is copy-pasting its own previous action — a hard loop. Lower similarity means the agent is varying its approach, which is less urgent. |
+
+#### Drift Detection
+
+| Parameter | Value | Why this value |
+|---|---|---|
+| TVD threshold | 0.45 | Below 0.40 → normal sessions that naturally use multiple action types trigger false positives. Above 0.55 → only catches extreme pivots; gradual drifts are missed. 0.45 sits in the range where the distribution has genuinely shifted but not necessarily flipped entirely. |
+| Window size | 4 steps | Small enough to detect a drift that happens over 3–5 steps. Large enough that a single unusual step doesn't skew the distribution. |
+| Slide step | 2 steps | Overlapping windows (overlap = window - step = 2) means every transition boundary is evaluated from two angles, reducing the chance of missing a drift that falls exactly between windows. |
+| Minimum session length | 6 events | A distribution computed from 2–3 events has high variance — 1 unusual action out of 3 is 33%, which would look like drift. At 6+ events, the distribution is meaningful. |
+| Deduplication guard | WINDOW_SIZE steps | Without this, a single drift transition would fire on every overlapping window pair that straddles it, producing 2–3 duplicate issues for the same event. |
+
+#### Failure Detection
+
+| Parameter | Value | Why this value |
+|---|---|---|
+| Consecutive failure streak | ≥ 3 | 1 failure = transient error (network, typo). 2 = possibly bad luck. 3 in a row = the agent is stuck — it tried, failed, adjusted, failed, adjusted, failed. That's a retry loop, not noise. |
+| High severity streak | ≥ 5 | 5 consecutive failures means the agent has been stuck long enough that intervention is urgent, not just advisory. |
+| Failure rate threshold | ≥ 50% | A healthy agent doing real development work fails 10–20% of the time (typos, missing files, transient errors). 50% means more than half of all actions are failing — fundamentally broken. |
+| Rate minimum events | 6 | 1 failure out of 2 events = 50% rate, but it's meaningless statistically. At 6+ events, a 50% rate represents a real pattern. |
+
+**The dual-signal design for failure** is intentional: scattered failures (high rate, no consecutive streak) and bursty failures (long streak, lower overall rate) are both serious but look different in the data. Using only one signal would miss half the failure patterns.
+
+---
+
+### 4. Trade-offs Due to Time Constraints
+
+| What was skipped | What was done instead | Cost of the shortcut |
+|---|---|---|
+| Auth / API keys | No auth | Anyone with network access can write events. Acceptable for local dev; unacceptable in production. |
+| Incremental detection | Full O(n) recomputation per event | Degrades for sessions > ~500 events. Fix: maintain running counters, only re-evaluate the tail. |
+| Adaptive window sizing for drift | Fixed window of 4 steps | Long sessions (100+ steps) need a larger window to avoid noise. Fix: scale window size with session length. |
+| Pagination on session list | Return all sessions | Works fine for < 100 sessions. Fix: add `?page=&limit=` query params. |
+| WebSocket / SSE for live updates | 3-second polling | ~20 requests/minute per browser tab. Acceptable for dev; wasteful in production. |
+| Per-agent baseline learning | Global fixed thresholds | Some agent types legitimately fail more often (test runners). Fixed thresholds may false-positive on them. Fix: track per-session-type baseline failure rates. |

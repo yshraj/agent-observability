@@ -127,49 +127,76 @@ def detect_loops(events: list[EventRecord]) -> list[DetectedIssue]:
 # Drift Detector
 # ---------------------------------------------------------------------------
 
-DRIFT_MIN_EVENTS = 6          # don't flag drift in tiny sessions
-DRIFT_TVD_THRESHOLD = 0.40    # total variation distance between halves
+DRIFT_MIN_EVENTS  = 6     # ignore sessions too short to have meaningful distributions
+DRIFT_WINDOW_SIZE = 4     # compare distributions across windows of this many steps
+DRIFT_STEP        = 2     # slide the window by this many steps each iteration
+DRIFT_TVD_THRESHOLD = 0.45  # TVD between consecutive windows to flag a drift point
 
 
 def detect_drift(events: list[EventRecord]) -> list[DetectedIssue]:
     """
-    Split session into first-half and second-half by step order.
-    Compute action-type distribution for each half.
-    If TVD >= DRIFT_TVD_THRESHOLD, the agent changed behavioural pattern.
+    Sliding window drift detection.
 
-    Extra signal: if the dominant action type flipped between halves, severity = high.
+    Rather than splitting the session at the midpoint (which misses multiple drifts
+    or cancels them out), we compare every consecutive pair of windows:
+
+        Window A: steps 1-4
+        Window B: steps 3-6   (overlaps A by DRIFT_WINDOW_SIZE - DRIFT_STEP)
+        Window C: steps 5-8
+        ...
+
+    If TVD between adjacent windows >= DRIFT_TVD_THRESHOLD, a drift point is recorded
+    at the boundary between them. Multiple drift points in the same session are all
+    reported as separate issues.
+
+    Deduplication: if two drift points are within DRIFT_WINDOW_SIZE steps of each
+    other they are merged into one (avoids double-counting the same transition).
     """
     if len(events) < DRIFT_MIN_EVENTS:
         return []
 
-    mid = len(events) // 2
-    first_half = events[:mid]
-    second_half = events[mid:]
+    issues: list[DetectedIssue] = []
+    last_flagged_at: int = -(DRIFT_WINDOW_SIZE * 2)  # tracks last drift position
 
-    dist1 = _action_distribution(first_half)
-    dist2 = _action_distribution(second_half)
-    tvd = _total_variation_distance(dist1, dist2)
+    for i in range(0, len(events) - DRIFT_WINDOW_SIZE, DRIFT_STEP):
+        window_a = events[i : i + DRIFT_WINDOW_SIZE]
+        window_b = events[i + DRIFT_STEP : i + DRIFT_STEP + DRIFT_WINDOW_SIZE]
 
-    if tvd < DRIFT_TVD_THRESHOLD:
-        return []
+        if len(window_b) < DRIFT_WINDOW_SIZE:
+            break
 
-    dominant1 = max(dist1, key=dist1.get) if dist1 else "none"
-    dominant2 = max(dist2, key=dist2.get) if dist2 else "none"
+        dist_a = _action_distribution(window_a)
+        dist_b = _action_distribution(window_b)
+        tvd    = _total_variation_distance(dist_a, dist_b)
 
-    flipped = dominant1 != dominant2
-    severity = "high" if flipped else "medium"
+        if tvd < DRIFT_TVD_THRESHOLD:
+            continue
 
-    description = (
-        f"Agent intent shifted mid-session (TVD={tvd:.2f}). "
-        f"Early pattern: mostly '{dominant1}'; later pattern: mostly '{dominant2}'."
-    )
+        # Suppress if we already flagged a drift nearby (within one window)
+        boundary_step = window_b[0].step
+        if boundary_step - last_flagged_at < DRIFT_WINDOW_SIZE:
+            continue
 
-    return [DetectedIssue(
-        issue_type="drift",
-        description=description,
-        severity=severity,
-        affected_steps=[e.step for e in events[mid:]],
-    )]
+        last_flagged_at = boundary_step
+
+        # Find what action type gained the most and lost the most
+        all_actions = set(dist_a) | set(dist_b)
+        gained = max(all_actions, key=lambda a: dist_b.get(a, 0) - dist_a.get(a, 0))
+        lost   = max(all_actions, key=lambda a: dist_a.get(a, 0) - dist_b.get(a, 0))
+        flipped = gained != lost
+        severity = "high" if flipped else "medium"
+
+        issues.append(DetectedIssue(
+            issue_type="drift",
+            description=(
+                f"Behavioral shift at step {boundary_step} (TVD={tvd:.2f}). "
+                f"'{lost}' decreased, '{gained}' increased."
+            ),
+            severity=severity,
+            affected_steps=[e.step for e in events[i + DRIFT_STEP:]],
+        ))
+
+    return issues
 
 
 # ---------------------------------------------------------------------------

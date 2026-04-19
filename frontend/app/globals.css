@@ -1,26 +1,58 @@
 @import "tailwindcss";
 
+/* Class-based dark mode — applies dark: variants when <html> has class="dark" */
+@variant dark (&:where(.dark, .dark *));
+
+/* ── Design tokens ── */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg:        #F8FAFC;
+  --surface:   #FFFFFF;
+  --surface-2: #F1F5F9;
+  --border:    #E2E8F0;
+  --ring:      #C7D2FE;
+  --tx-1:      #0F172A;
+  --tx-2:      #475569;
+  --tx-3:      #94A3B8;
+  --primary:   #6366F1;
+  --primary-h: #4F46E5;
+  --primary-bg:#EEF2FF;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+.dark {
+  --bg:        #09101E;
+  --surface:   #111827;
+  --surface-2: #1C2A40;
+  --border:    #1E293B;
+  --ring:      #3730A3;
+  --tx-1:      #F1F5F9;
+  --tx-2:      #94A3B8;
+  --tx-3:      #475569;
+  --primary:   #818CF8;
+  --primary-h: #A5B4FC;
+  --primary-bg:#1E1B4B;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  background: var(--bg);
+  color: var(--tx-1);
+  -webkit-font-smoothing: antialiased;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg);
+  color: var(--tx-1);
+  min-height: 100vh;
 }
+
+/* Smooth theme transition */
+*, *::before, *::after {
+  transition-property: background-color, border-color, color;
+  transition-duration: 150ms;
+  transition-timing-function: ease;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--tx-3); }
